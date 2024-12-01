@@ -6,13 +6,15 @@ const cors = require("cors");
 const multer = require("multer");
 const fileUpload = require("express-fileupload");
 const fs = require("fs");
-const axios = require("axios"); // Added axios import
+const axios = require("axios");
+const sharp = require("sharp"); // Imported sharp library for image compression
 require("dotenv").config();
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 app.use(fileUpload());
+app.use('/uploads', express.static('uploads')); // Serve static files
 
 // MongoDB Atlas connection
 const MONGO_URI = process.env.MONGO_URI || "mongodb+srv://rajasri:rajasri@cluster0.irmyw.mongodb.net/users?retryWrites=true&w=majority&appName=Cluster0";
@@ -34,6 +36,43 @@ const userSchema = new mongoose.Schema({
 });
 
 const User = mongoose.model("User", userSchema);
+
+// Diagnosis Schema
+const diagnosisSchema = new mongoose.Schema({
+  userId: { 
+    type: mongoose.Schema.Types.ObjectId, 
+    ref: 'User', 
+    required: true 
+  },
+  imagePath: { 
+    type: String, 
+    required: true 
+  },
+  diagnosis: [{
+    label: String,
+    score: Number
+  }],
+  createdAt: { 
+    type: Date, 
+    default: Date.now 
+  }
+});
+
+const Diagnosis = mongoose.model("Diagnosis", diagnosisSchema);
+
+const authenticateToken = (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+
+  if (token == null) return res.sendStatus(401);
+
+  jwt.verify(token, "SECRET_KEY", (err, user) => {
+    if (err) return res.sendStatus(403);
+    req.user = user;
+    next();
+  });
+};
+
 
 // Signup route
 app.post("/signup", async (req, res) => {
@@ -96,7 +135,7 @@ app.post("/upload", upload.single("file"), (req, res) => {
 });
 
 // Image upload for Hugging Face API
-app.post("/api/upload", async (req, res) => {
+app.post("/api/upload", authenticateToken, async (req, res) => {
   if (!req.files || !req.files.image) {
     return res.status(400).send({ message: "No image file uploaded" });
   }
@@ -109,9 +148,13 @@ app.post("/api/upload", async (req, res) => {
   }
 
   try {
+    // Compress the image before sending to the model
+    const compressedBuffer = await sharp(buffer).resize(224, 224).jpeg({ quality: 80 }).toBuffer();
+
+    // Send compressed image to Hugging Face model
     const response = await axios.post(
       "https://api-inference.huggingface.co/models/ozair23/mobilenet_v2_1.0_224-finetuned-plantdisease",
-      buffer,
+      compressedBuffer,
       {
         headers: {
           Authorization: `Bearer ${process.env.HUGGING_FACE_API_KEY}`,
@@ -120,10 +163,60 @@ app.post("/api/upload", async (req, res) => {
       }
     );
 
-    res.json({ diagnosis: response.data });
+    // Save the uploaded image
+    const imageName = `uploads/${Date.now()}-${image.name}`;
+    fs.writeFileSync(imageName, compressedBuffer);
+
+    // Save diagnosis to database
+    const newDiagnosis = new Diagnosis({
+      userId: req.user.id,
+      imagePath: imageName,
+      diagnosis: response.data
+    });
+    await newDiagnosis.save();
+
+    res.json({ 
+      diagnosis: response.data,
+      imagePath: imageName
+    });
   } catch (error) {
     console.error("Error processing image:", error.message);
     res.status(500).send({ message: "Error processing image" });
+  }
+});
+
+
+// const authenticate = (req, res, next) => {
+//   const token = req.headers.authorization?.split(" ")[1]; // Token is expected in the format "Bearer <token>"
+  
+//   if (!token) {
+//     return res.status(401).json({ message: "Access Denied. No token provided." });
+//   }
+
+//   try {
+//     const decoded = jwt.verify(token, "SECRET_KEY"); // Use the same secret key as in the login route
+//     req.userId = decoded.id; // Attach the user ID to the request object
+//     next();
+//   } catch (err) {
+//     res.status(403).json({ message: "Invalid token." });
+//   }
+// };
+app.get("/diagnosis-history", authenticateToken, async (req, res) => {
+  try {
+    const diagnoses = await Diagnosis.find({ userId: req.user.id })
+      .sort({ createdAt: -1 }); // Sort by most recent first
+    res.json(diagnoses);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+app.get("/history", authenticateToken, async (req, res) => {
+  try {
+    const diagnoses = await Diagnosis.find({ userId: req.user.id })
+      .sort({ createdAt: -1 }); // Sort by most recent first
+    res.render("history", { diagnoses });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
